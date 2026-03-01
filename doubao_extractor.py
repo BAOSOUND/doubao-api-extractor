@@ -1,21 +1,37 @@
 import streamlit as st
 import pandas as pd
+import os
+import sys
+import subprocess
 import re
 import asyncio
 import random
 import time
 from datetime import datetime
-from playwright.async_api import async_playwright
 import openai
 
+# ===== 先导入 playwright =====
+from playwright.async_api import async_playwright
+
+# ===== 安装 Playwright 浏览器（仅首次运行）=====
+playwright_cache = "/home/appuser/.cache/ms-playwright"
+if not os.path.exists(playwright_cache):
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        st.success("✅ Playwright 浏览器安装完成")
+    except Exception as e:
+        st.error(f"❌ Playwright 浏览器安装失败: {e}")
+# ===== 结束 =====
+
 # ===== 解决 Windows 下 Playwright 的 NotImplementedError =====
-import sys
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 # ===== 结束 =====
 
 # ===== 页面配置 =====
 st.set_page_config(page_title="豆包引用提取器", page_icon="🥔", layout="wide")
+
+# ... 后面的代码保持不变 ...
 
 # ===== 自定义CSS =====
 st.markdown("""

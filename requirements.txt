@@ -1,11 +1,6 @@
-# 通用依赖
 streamlit
 pandas
 openai
-
-# DeepSeek 专属
-requests
-
-# 豆包 专属
 playwright
 fake-useragent
+requests
