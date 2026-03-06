@@ -1,0 +1,9 @@
+*.bak
+*.pyc
+__pycache__/
+web-ui/
+article_extractor.py
+debug_html.txt
+*extractor - *.py
+search_app.py
+search_app.py.bak
