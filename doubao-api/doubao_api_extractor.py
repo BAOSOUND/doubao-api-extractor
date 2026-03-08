@@ -82,9 +82,6 @@ class DoubaoAPIExtractor:
             max_keyword: 单次搜索最大关键词数量（控制成本）
             stream: 是否流式输出
             temperature: 温度参数
-        
-        Returns:
-            包含回答和元数据的字典
         """
         # 构建 input 数组
         input_messages = []
@@ -176,9 +173,7 @@ class DoubaoAPIExtractor:
             }
     
     def ask_stream(self, question: str, system_prompt: str = None, enable_search: bool = True):
-        """
-        流式问答生成器 - 用于实时显示思考过程
-        """
+        """流式问答生成器 - 用于实时显示思考过程"""
         input_messages = []
         if system_prompt:
             input_messages.append({
@@ -247,9 +242,7 @@ class DoubaoAPIExtractor:
                      brand_name: str, 
                      aspects: List[str] = None,
                      force_search: bool = True) -> Dict:
-        """
-        品牌分析 - 会智能判断是否需要联网
-        """
+        """品牌分析 - 会智能判断是否需要联网"""
         if aspects:
             aspects_str = "、".join(aspects)
             prompt = f"请对【{brand_name}】进行深度品牌分析，重点关注：{aspects_str}。请提供最新数据和信息来源。"
@@ -258,7 +251,7 @@ class DoubaoAPIExtractor:
         
         system_prompt = """你是一个专业的品牌分析专家。你的特点是：
 1. 需要最新信息时会自动联网搜索
-2. 提供结构化、多维度的分析报告
+2. 提供结构化、多维度分析报告
 3. 明确标注信息来源
 4. 如果信息不足，诚实说明局限性"""
         
@@ -392,7 +385,6 @@ def clean_filename(text, max_length=50):
 
 def run_streamlit():
     """启动Streamlit界面 - 完全复制deepseek-extractor.py风格"""
-    # 在这里导入 streamlit，确保它在函数内部被导入
     import streamlit as st
     import pandas as pd
     
@@ -479,19 +471,16 @@ def run_streamlit():
     # ===== 侧边栏 =====
     with st.sidebar:
         # ===== 添加图标（blsicon.png）=====
-        icon_path = "blsicon.png"  # 图标文件放在同目录下
+        icon_path = "blsicon.png"
         
         if os.path.exists(icon_path):
-            # 读取图片并转换为 base64
             with open(icon_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode()
             
-            # 使用 HTML img 标签，设置 alt 和 title（鼠标悬停显示）
             html_code = f'<img src="data:image/png;base64,{img_data}" width="120" alt="宝宝爆是俺拉" title="宝宝爆是俺拉">'
             st.markdown(html_code, unsafe_allow_html=True)
         else:
-            st.markdown("#### 🥔")  # 如果图片不存在，显示豆包emoji
-        # ===== 结束图标 =====
+            st.markdown("#### 🥔")
         
         st.header("⚙️ 搜索配置")
         
@@ -502,20 +491,31 @@ def run_streamlit():
         if api_key and endpoint_id:
             st.success("✅ API已连接")
             
-            # 条件配置展开项（原查看详情）
             with st.expander("🔧 条件配置"):
-                st.markdown(f"""
-                - **模型：** Doubao2.0 Pro
-                - **接入点：** Resposonse API
-                - **关键词数：** 1
-                - **温度：** 0.3 (默认)
-                - **流式输出：** 关闭
-                """)
+                st.markdown(f"**模型：** Doubao2.0 Pro")
+                st.markdown(f"**接入点：** Response API")
+                
+                max_keyword = st.number_input(
+                    "📊 搜索关键词数量",
+                    min_value=1,
+                    max_value=3,
+                    value=1,
+                    step=1,
+                    help="单次搜索的最大关键词数量，越多成本越高但可能更准确"
+                )
+                
+                temperature = st.slider(
+                    "🌡️ 温度 (0-1)",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.3,
+                    step=0.05,
+                    help="越低越稳定，越高越有创造性"
+                )
         else:
             st.error("❌ 请配置 .env 文件")
             st.stop()
         
-        # 联网搜索开关（保持在外部）
         enable_search = st.checkbox("🌐 允许联网搜索", value=True, 
                                    help="开启后，模型会判断是否需要上网查最新信息")
         
@@ -529,7 +529,6 @@ def run_streamlit():
             if not query:
                 st.warning("请输入问题")
             else:
-                # 重置数据
                 st.session_state.search_result = None
                 st.session_state.citations = []
                 st.session_state.answer_text = ""
@@ -538,19 +537,17 @@ def run_streamlit():
                 with st.spinner("🤔 AI思考中..."):
                     client = DoubaoAPIExtractor()
                     
-                    # 非流式输出（默认关闭）
                     result = client.ask(
                         question=query,
                         enable_search=enable_search,
-                        max_keyword=1,  # 固定为1
-                        temperature=0.3,  # 固定为0.3
-                        stream=False  # 固定关闭流式
+                        max_keyword=max_keyword,
+                        temperature=temperature,
+                        stream=False
                     )
                     
                     if result["success"]:
                         st.session_state.answer_text = result["content"]
                         
-                        # 从 annotations 中提取引用来源
                         citations = []
                         seen_urls = set()
                         
@@ -561,9 +558,7 @@ def run_streamlit():
                                     if url and url not in seen_urls:
                                         seen_urls.add(url)
                                         
-                                        # 获取发布时间（如果有的话）
                                         publish_time = ""
-                                        # 尝试从不同的字段名获取发布时间
                                         if "publish_time" in ann:
                                             publish_time = ann.get("publish_time", "")
                                         elif "publish_time_second" in ann:
@@ -580,18 +575,14 @@ def run_streamlit():
                                             '发布时间': publish_time
                                         })
                         
-                        # 如果 annotations 为空，回退到正则提取
                         if not citations:
-                            # 模式1: 提取 [数字](url) 格式
                             citation_pattern = r'\[(\d+)\]\((https?://[^\s\)]+)\)'
                             matches = re.findall(citation_pattern, result["content"])
                             
                             for num, url in matches:
                                 if url not in seen_urls:
                                     seen_urls.add(url)
-                                    # 尝试从上下文中提取标题
                                     title = f"引用 {num}"
-                                    # 查找引用附近的文本作为标题
                                     lines = result["content"].split('\n')
                                     for i, line in enumerate(lines):
                                         if f"[{num}]" in line or url in line:
@@ -606,7 +597,6 @@ def run_streamlit():
                                         '发布时间': ''
                                     })
                             
-                            # 模式2: 提取 markdown 链接 [标题](url)
                             md_link_pattern = r'\[([^\]]+)\]\((https?://[^\s\)]+)\)'
                             md_matches = re.findall(md_link_pattern, result["content"])
                             
@@ -620,7 +610,6 @@ def run_streamlit():
                                         '发布时间': ''
                                     })
                             
-                            # 模式3: 提取纯URL
                             url_pattern = r'(https?://[^\s<>"{}|\\^`\[\]]+)'
                             url_matches = re.findall(url_pattern, result["content"])
                             
@@ -654,35 +643,26 @@ def run_streamlit():
     # ===== 显示结果 =====
     if st.session_state.search_result or st.session_state.answer_text:
         
-        # ===== 显示询问词 =====
         if st.session_state.question:
             st.markdown(f"### 🔍 询问词: {st.session_state.question}")
         
-        # ===== 显示AI回答 =====
         if st.session_state.answer_text:
             st.markdown("---")
             st.subheader("📄 AI 回答")
             
-            # 处理文本格式，保留换行
             answer_text = st.session_state.answer_text
             
-            # 用 info 框把回答包起来，视觉上更清晰
             with st.container():
-                # 检查文本中是否包含列表格式
                 if "1." in answer_text or "2." in answer_text or "•" in answer_text:
-                    # 对于列表内容，使用 markdown 保持格式
                     formatted_text = answer_text.replace('\n', '  \n')
                     st.info(formatted_text)
                 else:
-                    # 对于普通文本，直接显示
                     st.info(answer_text)
         
-        # ===== 显示引用来源 =====
         if st.session_state.citations:
             st.markdown("---")
             st.subheader(f"🔗 引用来源 (共找到 {len(st.session_state.citations)} 条)")
             
-            # 创建HTML表格（三列：网站标题，URL，发布时间）
             html_table = "<table style='width:100%; border-collapse: collapse; margin-bottom: 20px;'>"
             html_table += "<tr style='background-color: #f0f2f6;'>"
             html_table += "<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width:5%'>序号</th>"
@@ -702,7 +682,6 @@ def run_streamlit():
             html_table += "</table>"
             st.markdown(html_table, unsafe_allow_html=True)
             
-            # 下载按钮
             if st.session_state.citations:
                 display_df = pd.DataFrame(st.session_state.citations)
                 csv = display_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
@@ -718,12 +697,11 @@ def run_streamlit():
                     key="download_citations"
                 )
     
-    # ===== 底部说明 =====
     st.markdown("---")
     st.caption("""
 💡 **提示**：
 1. 网页版豆包 ≠ API 版豆包，同一个问题，回答很可能不一样
-2. 左侧可开关联网搜索
+2. 左侧可开关联网搜索，调节关键词数量和温度
 3. 模型会根据问题自主判断是否需要联网
 4. 引用来源自动从API返回中提取，包含完整标题和发布时间（如提供）
 """)
@@ -745,12 +723,10 @@ def main_cli():
     
     args = parser.parse_args()
     
-    # 启动图形界面
     if args.gui:
         run_streamlit()
         return
     
-    # 创建配置文件
     if args.setup:
         create_env_file()
         return
@@ -814,13 +790,11 @@ def main_cli():
         parser.print_help()
         return
     
-    # 保存结果
     if args.save and result and result.get("success", False):
         content = result.get("analysis") or result.get("comparison") or result.get("result") or result.get("content")
         if content:
             extractor.save_to_file(content)
     
-    # 显示token用量
     if result and result.get("success", False) and result.get("usage"):
         usage = result.get("usage")
         print(f"\n📊 Token用量: {usage.get('total_tokens', 0)}")
@@ -829,8 +803,6 @@ def main_cli():
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
-        # 如果有命令行参数，走命令行模式
         main_cli()
     else:
-        # 没有参数时，直接启动 Streamlit 界面
         run_streamlit()
