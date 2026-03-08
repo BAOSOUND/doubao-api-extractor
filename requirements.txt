@@ -1,6 +1,0 @@
-streamlit
-pandas
-openai
-playwright
-fake-useragent
-requests
