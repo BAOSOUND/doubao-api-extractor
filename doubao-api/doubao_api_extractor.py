@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-豆包API提取器 - 智能联网版
+豆包API提取器 - 智能联网版（批量处理版）
 基于火山引擎Responses API，支持像网页版一样智能判断的联网搜索
-完全复刻deepseek-extractor.py的界面风格
 """
 
 import os
@@ -10,8 +9,11 @@ import json
 import argparse
 import re
 import base64
+import time
+import hashlib
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+from functools import wraps
 
 try:
     import requests
@@ -31,16 +33,34 @@ except ImportError:
 load_dotenv()
 
 
+def retry_on_timeout(max_retries=2, delay=2):
+    """超时重试装饰器"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(delay * (attempt + 1))
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 class DoubaoAPIExtractor:
     """豆包API提取器 - Responses API版（智能联网）"""
     
-    def __init__(self, api_key: str = None, endpoint_id: str = None):
+    def __init__(self, api_key: str = None, endpoint_id: str = None, use_cache: bool = True):
         """
         初始化豆包API提取器
         
         Args:
             api_key: 火山引擎API Key
             endpoint_id: 接入点ID (格式: ep-xxxxxx)
+            use_cache: 是否启用缓存
         """
         self.api_key = api_key or os.getenv("DOUBAO_API_KEY")
         self.endpoint_id = endpoint_id or os.getenv("DOUBAO_ENDPOINT_ID")
@@ -57,32 +77,73 @@ class DoubaoAPIExtractor:
             "Authorization": f"Bearer {self.api_key}"
         }
         
+        # 缓存配置
+        self.use_cache = use_cache
+        self.cache = {}
+        self.cache_ttl = 3600  # 缓存1小时
+        
         # 调用统计
         self.stats = {
             "total_calls": 0,
+            "cache_hits": 0,
             "total_tokens": 0,
             "total_searches": 0,
             "last_call_time": None
         }
     
+    def _get_cache_key(self, question: str, enable_search: bool, max_keyword: int, temperature: float) -> str:
+        """生成缓存键"""
+        key_data = f"{question}|{enable_search}|{max_keyword}|{temperature}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def _enhance_question(self, question: str) -> str:
+        """自动为问题添加时效锚点"""
+        current_date = datetime.now().strftime("%Y年%m月%d日")
+        
+        # 检查是否已有时间锚点
+        time_keywords = ['今天', '现在', '最新', '最近', '截至', '目前', '当前', '实时']
+        if not any(kw in question for kw in time_keywords):
+            question = f"截至{current_date}，{question}。请只返回最近的信息，并标注来源。"
+        
+        return question
+    
+    @retry_on_timeout(max_retries=2, delay=2)
     def ask(self, 
             question: str,
             system_prompt: str = None,
             enable_search: bool = True,
             max_keyword: int = 1,
-            stream: bool = False,
-            temperature: float = 0.3) -> Dict:
+            temperature: float = 0.3,
+            auto_enhance: bool = True,
+            use_caching: bool = True,
+            previous_response_id: str = None) -> Dict:
         """
         通用问答方法 - 智能判断是否需要联网
         
         Args:
             question: 用户问题
             system_prompt: 系统提示词（可选）
-            enable_search: 是否允许联网搜索（模型会自主判断是否需要）
-            max_keyword: 单次搜索最大关键词数量（控制成本）
-            stream: 是否流式输出
+            enable_search: 是否允许联网搜索
+            max_keyword: 单次搜索最大关键词数量
             temperature: 温度参数
+            auto_enhance: 是否自动添加时效锚点
+            use_caching: 是否使用缓存
+            previous_response_id: 上一轮的响应ID（用于多轮对话）
         """
+        # 自动优化问题
+        if enable_search and auto_enhance:
+            question = self._enhance_question(question)
+        
+        # 检查缓存（仅在不联网时使用）
+        if use_caching and self.use_cache and not enable_search:
+            cache_key = self._get_cache_key(question, enable_search, max_keyword, temperature)
+            if cache_key in self.cache:
+                cached_result = self.cache[cache_key]
+                # 检查是否过期
+                if time.time() - cached_result['timestamp'] < self.cache_ttl:
+                    self.stats["cache_hits"] += 1
+                    return cached_result['data']
+        
         # 构建 input 数组
         input_messages = []
         if system_prompt:
@@ -100,8 +161,13 @@ class DoubaoAPIExtractor:
             "model": self.endpoint_id,
             "input": input_messages,
             "temperature": temperature,
-            "stream": stream
+            "stream": False
         }
+        
+        # 注意：caching 和 tools 不能同时使用！
+        # 只有在不联网时才启用缓存
+        if use_caching and not enable_search:
+            data["caching"] = {"type": "enabled"}
         
         # 如果允许联网，添加 tools 参数
         if enable_search:
@@ -109,13 +175,20 @@ class DoubaoAPIExtractor:
                 "type": "web_search",
                 "max_keyword": max_keyword
             }]
+            # 联网时不使用缓存（即使设置了也忽略）
+            use_caching = False
+        
+        # 使用上一轮的响应ID
+        if previous_response_id:
+            data["previous_response_id"] = previous_response_id
         
         try:
+            # 设置合理的超时：连接15秒，读取60秒
             response = requests.post(
                 self.base_url,
                 headers=self.headers,
                 json=data,
-                timeout=60
+                timeout=(15, 60)
             )
             
             self.stats["total_calls"] += 1
@@ -148,15 +221,30 @@ class DoubaoAPIExtractor:
                 if "usage" in result:
                     self.stats["total_tokens"] += result["usage"].get("total_tokens", 0)
                 
-                return {
+                # 从回答文本中二次提取引用（增强）
+                text_citations = self._extract_citations_from_text(answer)
+                if text_citations and not annotations:
+                    annotations = text_citations
+                
+                final_result = {
                     "content": answer,
                     "success": True,
                     "annotations": annotations,
                     "tool_usage": tool_usage,
                     "searched": search_count > 0,
                     "usage": result.get("usage"),
-                    "raw_response": result if stream else None
+                    "response_id": result.get("id"),
+                    "raw_response": result
                 }
+                
+                # 存入缓存（仅在不联网时缓存）
+                if use_caching and self.use_cache and not enable_search:
+                    self.cache[cache_key] = {
+                        'timestamp': time.time(),
+                        'data': final_result
+                    }
+                
+                return final_result
             else:
                 error_msg = f"HTTP {response.status_code}: {response.text}"
                 return {
@@ -165,64 +253,30 @@ class DoubaoAPIExtractor:
                     "error": error_msg
                 }
                 
+        except requests.exceptions.ConnectTimeout:
+            return {
+                "content": None,
+                "success": False,
+                "error": "连接超时，请检查网络后重试"
+            }
+        except requests.exceptions.ReadTimeout:
+            return {
+                "content": None,
+                "success": False,
+                "error": "读取超时，服务响应较慢，请稍后重试"
+            }
+        except requests.exceptions.ConnectionError as e:
+            return {
+                "content": None,
+                "success": False,
+                "error": f"连接错误: {str(e)}"
+            }
         except Exception as e:
             return {
                 "content": None,
                 "success": False,
                 "error": str(e)
             }
-    
-    def ask_stream(self, question: str, system_prompt: str = None, enable_search: bool = True):
-        """流式问答生成器 - 用于实时显示思考过程"""
-        input_messages = []
-        if system_prompt:
-            input_messages.append({
-                "role": "system",
-                "content": [{"type": "input_text", "text": system_prompt}]
-            })
-        input_messages.append({
-            "role": "user",
-            "content": [{"type": "input_text", "text": question}]
-        })
-        
-        data = {
-            "model": self.endpoint_id,
-            "input": input_messages,
-            "stream": True,
-            "temperature": 0.3
-        }
-        
-        if enable_search:
-            data["tools"] = [{
-                "type": "web_search",
-                "max_keyword": 1
-            }]
-        
-        try:
-            response = requests.post(
-                self.base_url,
-                headers=self.headers,
-                json=data,
-                stream=True,
-                timeout=120
-            )
-            
-            if response.status_code == 200:
-                for line in response.iter_lines():
-                    if line:
-                        line = line.decode('utf-8')
-                        if line.startswith('data: '):
-                            try:
-                                chunk = json.loads(line[6:])
-                                yield chunk
-                            except json.JSONDecodeError:
-                                continue
-                yield {"type": "response.completed"}
-            else:
-                yield {"type": "error", "content": f"错误: {response.text}"}
-                
-        except Exception as e:
-            yield {"type": "error", "content": f"异常: {e}"}
     
     def _extract_answer(self, response_data: Dict) -> str:
         """从Responses API返回中提取回答文本"""
@@ -237,6 +291,143 @@ class DoubaoAPIExtractor:
             return "无法提取回答内容"
         except Exception:
             return str(response_data)
+    
+    def _extract_citations_from_text(self, text: str) -> List[Dict]:
+        """从回答文本中提取所有可能的引用"""
+        citations = []
+        seen_urls = set()
+        
+        # 模式1: [标题](url)
+        md_pattern = r'\[([^\]]+)\]\((https?://[^\s\)]+)\)'
+        md_matches = re.findall(md_pattern, text)
+        for title, url in md_matches:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                citations.append({
+                    "type": "url_citation",
+                    "title": title[:100],
+                    "url": url,
+                    "source": "markdown_link"
+                })
+        
+        # 模式2: [数字](url)
+        num_pattern = r'\[(\d+)\]\((https?://[^\s\)]+)\)'
+        num_matches = re.findall(num_pattern, text)
+        for num, url in num_matches:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                citations.append({
+                    "type": "url_citation",
+                    "title": f"引用{num}",
+                    "url": url,
+                    "source": "citation_link"
+                })
+        
+        # 模式3: 纯URL
+        url_pattern = r'(https?://[^\s<>"\'()\[\]]+)'
+        urls = re.findall(url_pattern, text)
+        for url in urls:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                # 尝试从上下文中提取标题
+                lines = text.split('\n')
+                title = ""
+                for i, line in enumerate(lines):
+                    if url in line:
+                        title = line.replace(url, '').strip()[:50]
+                        break
+                citations.append({
+                    "type": "url_citation",
+                    "title": title or f"来源{len(citations)+1}",
+                    "url": url,
+                    "source": "plain_url"
+                })
+        
+        return citations
+    
+    def _extract_snippet_for_url(self, answer_text: str, url: str) -> str:
+        """
+        从回答内容中提取包含该URL的上下文作为摘要
+        """
+        if not answer_text or not url:
+            return ""
+        
+        # 按句子分割（简单版本）
+        sentences = answer_text.replace('。', '。\n').replace('！', '！\n').replace('？', '？\n').split('\n')
+        
+        # 寻找包含URL的句子
+        for sentence in sentences:
+            if url in sentence:
+                # 返回包含URL的句子作为摘要（限制长度）
+                return sentence.strip()[:200]
+        
+        # 如果没找到包含URL的句子，找包含域名的句子
+        domain_match = re.search(r'https?://([^/]+)', url)
+        if domain_match:
+            domain = domain_match.group(1)
+            for sentence in sentences:
+                if domain in sentence:
+                    return sentence.strip()[:200]
+        
+        return ""
+    
+    def deep_search(self, question: str, rounds: int = 2, **kwargs) -> Dict:
+        """模拟网页版的深度思考 - 多轮搜索"""
+        
+        all_answers = []
+        all_citations = []
+        last_response_id = None
+        
+        # 第一轮：基础搜索
+        result1 = self.ask(question, **kwargs)
+        if result1["success"]:
+            all_answers.append(result1["content"])
+            all_citations.extend(result1.get("annotations", []))
+            last_response_id = result1.get("response_id")
+            
+            # 提取关键实体，优化下一轮搜索
+            if rounds >= 2:
+                key_entities = self._extract_key_entities(result1["content"])
+                if key_entities:
+                    refined_q = f"{question}\n重点查询：{', '.join(key_entities[:3])}"
+                    result2 = self.ask(
+                        refined_q, 
+                        previous_response_id=last_response_id,
+                        **kwargs
+                    )
+                    if result2["success"]:
+                        all_answers.append(result2["content"])
+                        all_citations.extend(result2.get("annotations", []))
+        
+        # 合并结果
+        final_answer = "\n\n---\n\n".join(all_answers)
+        
+        return {
+            "content": final_answer,
+            "success": True,
+            "annotations": all_citations,
+            "searched": True,
+            "rounds": len(all_answers)
+        }
+    
+    def _extract_key_entities(self, text: str, max_entities: int = 3) -> List[str]:
+        """从文本中提取关键实体（简单实现）"""
+        entities = []
+        
+        # 找中文词语（2-5个字）
+        chinese_pattern = r'[\u4e00-\u9fa5]{2,5}'
+        found = re.findall(chinese_pattern, text)
+        entities.extend(found[:max_entities])
+        
+        # 去重
+        unique_entities = []
+        seen = set()
+        for e in entities:
+            if e not in seen and len(e) > 1:
+                seen.add(e)
+                unique_entities.append(e)
+        
+        return unique_entities[:max_entities]
     
     def analyze_brand(self, 
                      brand_name: str, 
@@ -325,7 +516,7 @@ class DoubaoAPIExtractor:
             return {
                 "brands": brands,
                 "aspects": aspects,
-                "comparison": result["content"],
+                "comparison": result["comparison"],
                 "searched": result.get("searched", False),
                 "annotations": result.get("annotations", []),
                 "timestamp": datetime.now().isoformat()
@@ -384,13 +575,13 @@ def clean_filename(text, max_length=50):
 
 
 def run_streamlit():
-    """启动Streamlit界面 - 完全复制deepseek-extractor.py风格"""
+    """启动Streamlit界面 - 批量处理版"""
     import streamlit as st
     import pandas as pd
     
     # ===== 页面配置 =====
     st.set_page_config(
-        page_title="豆包智能搜索",
+        page_title="豆包智能搜索（批量版）",
         page_icon="🥔",
         layout="wide"
     )
@@ -398,26 +589,9 @@ def run_streamlit():
     # ===== 自定义CSS =====
     st.markdown("""
     <style>
-        /* 让表格单元格内容自动换行 */
-        .stDataFrame div[data-testid="stDataFrameResizable"] div[data-testid="column-header-0"],
-        .stDataFrame div[data-testid="stDataFrameResizable"] div[data-testid="column-header-1"],
-        .stDataFrame div[data-testid="stDataFrameResizable"] div[data-testid="column-header-2"],
-        .stDataFrame div[data-testid="stDataFrameResizable"] div[data-testid="column-header-3"],
-        .stDataFrame td {
-            white-space: normal !important;
-            word-wrap: break-word !important;
-            max-width: none !important;
-        }
-        
-        /* 调整列宽比例 */
-        div[data-testid="stDataFrameResizable"] div[data-testid="column-header-0"] { width: 5% !important; }  /* 序号 */
-        div[data-testid="stDataFrameResizable"] div[data-testid="column-header-1"] { width: 25% !important; } /* 网站标题 */
-        div[data-testid="stDataFrameResizable"] div[data-testid="column-header-2"] { width: 50% !important; } /* URL */
-        div[data-testid="stDataFrameResizable"] div[data-testid="column-header-3"] { width: 20% !important; } /* 发布时间 */
-        
-        /* 确保表格容器没有滚动条 */
-        div[data-testid="stDataFrameResizable"] {
-            overflow-x: hidden !important;
+        /* 表格样式 */
+        .stDataFrame {
+            width: 100%;
         }
         
         /* 链接样式 */
@@ -430,281 +604,287 @@ def run_streamlit():
             text-decoration: underline;
         }
         
-        /* 保持AI回答的换行格式 */
-        .stMarkdown p {
-            white-space: pre-wrap !important;
-            margin-bottom: 0.5rem !important;
+        /* AI回答区域 */
+        .answer-box {
+            background-color: #f0f2f6;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 10px 0;
+            white-space: pre-wrap;
+            font-family: inherit;
+            line-height: 1.6;
         }
         
-        /* 让列表样式更清晰 */
-        .stMarkdown ul, .stMarkdown ol {
-            margin-top: 0.25rem !important;
-            margin-bottom: 0.5rem !important;
-            padding-left: 1.5rem !important;
+        /* 旋转加载动画 */
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
-        
-        /* info框内的文本样式 */
-        .stAlert p {
-            white-space: pre-wrap !important;
-            margin-bottom: 0.5rem !important;
+        .loading-spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
         }
     </style>
     """, unsafe_allow_html=True)
     
-    # ===== 标题 =====
-    st.title("🥔 豆包智能搜索")
-    st.markdown("---")
-    
-    # ===== 输入框 =====
-    query = st.text_input("🔍 输入你的问题", placeholder="例如：今天上海天气怎么样？")
-    
     # ===== 初始化session state =====
-    if 'search_result' not in st.session_state:
-        st.session_state.search_result = None
-    if 'citations' not in st.session_state:
-        st.session_state.citations = []
-    if 'answer_text' not in st.session_state:
-        st.session_state.answer_text = ""
-    if 'question' not in st.session_state:
-        st.session_state.question = ""
+    if 'results' not in st.session_state:
+        st.session_state.results = []
+    if 'processing' not in st.session_state:
+        st.session_state.processing = False
+    if 'all_citations' not in st.session_state:
+        st.session_state.all_citations = []
+    
+    # ===== 标题 =====
+    st.title("🥔 豆包智能搜索 - 批量版")
+    st.markdown("> 支持多问题批量处理，自动提取引用来源")
+    st.markdown("---")
     
     # ===== 侧边栏 =====
     with st.sidebar:
-        # ===== 添加图标（blsicon.png）=====
+        # 图标
         icon_path = "blsicon.png"
-        
         if os.path.exists(icon_path):
             with open(icon_path, "rb") as f:
                 img_data = base64.b64encode(f.read()).decode()
-            
             html_code = f'<img src="data:image/png;base64,{img_data}" width="120" alt="宝宝爆是俺拉" title="宝宝爆是俺拉">'
             st.markdown(html_code, unsafe_allow_html=True)
         else:
             st.markdown("#### 🥔")
         
-        st.header("⚙️ 搜索配置")
+        st.markdown("---")
         
         # API配置状态
         api_key = os.getenv("DOUBAO_API_KEY")
         endpoint_id = os.getenv("DOUBAO_ENDPOINT_ID")
         
-        if api_key and endpoint_id:
-            st.success("✅ API已连接")
-            
-            with st.expander("🔧 条件配置"):
-                st.markdown(f"**模型：** Doubao2.0 Pro")
-                st.markdown(f"**接入点：** Response API")
-                
-                max_keyword = st.number_input(
-                    "📊 搜索关键词数量",
-                    min_value=1,
-                    max_value=3,
-                    value=1,
-                    step=1,
-                    help="单次搜索的最大关键词数量，越多成本越高但可能更准确"
-                )
-                
-                temperature = st.slider(
-                    "🌡️ 温度 (0-1)",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.3,
-                    step=0.05,
-                    help="越低越稳定，越高越有创造性"
-                )
-        else:
-            st.error("❌ 请配置 .env 文件")
+        if not api_key or not endpoint_id:
+            st.error("❌ 请先配置 .env 文件")
             st.stop()
+        else:
+            st.success("✅ API已连接")
         
-        enable_search = st.checkbox("🌐 允许联网搜索", value=True, 
-                                   help="开启后，模型会判断是否需要上网查最新信息")
+        # 配置选项
+        st.header("⚙️ 搜索配置")
+        
+        enable_search = st.checkbox("🌐 允许联网搜索", value=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            max_keyword = st.number_input("关键词数量", min_value=1, max_value=3, value=1)
+        with col2:
+            temperature = st.slider("温度", 0.0, 1.0, 0.3, 0.05)
+        
+        use_cache = st.checkbox("💾 启用缓存", value=True)
+        use_deep = st.checkbox("🧠 深度思考", value=False, help="多轮搜索，更深入")
         
         st.markdown("---")
         st.caption("喜欢就分享出去")
     
-    # ===== 主逻辑：搜索按钮 =====
+    # ===== 主界面 - 多问题输入 =====
+    st.markdown("### 📝 问题列表")
+    st.markdown("**每行一个问题**")
+    
+    questions_text = st.text_area(
+        "问题列表",
+        height=150,
+        placeholder="例如：\n今天上海天气怎么样？\n2024年AI发展趋势\nPython异步编程的优点",
+        label_visibility="collapsed"
+    )
+    
+    questions = [q.strip() for q in questions_text.split('\n') if q.strip()]
+    
+    if questions:
+        st.info(f"📊 共 {len(questions)} 个问题")
+        with st.expander("预览问题列表"):
+            for i, q in enumerate(questions, 1):
+                st.write(f"{i}. {q}")
+    
+    # ===== 控制按钮 =====
     col1, col2 = st.columns([1, 5])
     with col1:
-        if st.button("🔍 开始搜索", type="primary", use_container_width=True):
-            if not query:
-                st.warning("请输入问题")
-            else:
-                st.session_state.search_result = None
-                st.session_state.citations = []
-                st.session_state.answer_text = ""
-                st.session_state.question = query
-                
-                with st.spinner("🤔 AI思考中..."):
-                    client = DoubaoAPIExtractor()
-                    
-                    result = client.ask(
-                        question=query,
-                        enable_search=enable_search,
-                        max_keyword=max_keyword,
-                        temperature=temperature,
-                        stream=False
-                    )
-                    
-                    if result["success"]:
-                        st.session_state.answer_text = result["content"]
-                        
-                        citations = []
-                        seen_urls = set()
-                        
-                        if result.get("annotations"):
-                            for ann in result["annotations"]:
-                                if ann.get("type") == "url_citation":
-                                    url = ann.get("url", "")
-                                    if url and url not in seen_urls:
-                                        seen_urls.add(url)
-                                        
-                                        publish_time = ""
-                                        if "publish_time" in ann:
-                                            publish_time = ann.get("publish_time", "")
-                                        elif "publish_time_second" in ann:
-                                            pub_time = ann.get("publish_time_second", "")
-                                            if pub_time and 'T' in pub_time:
-                                                publish_time = pub_time.split('T')[0]
-                                            else:
-                                                publish_time = pub_time
-                                        
-                                        citations.append({
-                                            '序号': len(citations) + 1,
-                                            '网站标题': ann.get("title", f"来源 {len(citations) + 1}"),
-                                            'URL': url,
-                                            '发布时间': publish_time
-                                        })
-                        
-                        if not citations:
-                            citation_pattern = r'\[(\d+)\]\((https?://[^\s\)]+)\)'
-                            matches = re.findall(citation_pattern, result["content"])
-                            
-                            for num, url in matches:
-                                if url not in seen_urls:
-                                    seen_urls.add(url)
-                                    title = f"引用 {num}"
-                                    lines = result["content"].split('\n')
-                                    for i, line in enumerate(lines):
-                                        if f"[{num}]" in line or url in line:
-                                            if i > 0 and len(lines[i-1].strip()) > 10:
-                                                title = lines[i-1].strip()[:50]
-                                            break
-                                    
-                                    citations.append({
-                                        '序号': len(citations) + 1,
-                                        '网站标题': title,
-                                        'URL': url,
-                                        '发布时间': ''
-                                    })
-                            
-                            md_link_pattern = r'\[([^\]]+)\]\((https?://[^\s\)]+)\)'
-                            md_matches = re.findall(md_link_pattern, result["content"])
-                            
-                            for title, url in md_matches:
-                                if url not in seen_urls and not any(c.get('URL') == url for c in citations):
-                                    seen_urls.add(url)
-                                    citations.append({
-                                        '序号': len(citations) + 1,
-                                        '网站标题': title[:50],
-                                        'URL': url,
-                                        '发布时间': ''
-                                    })
-                            
-                            url_pattern = r'(https?://[^\s<>"{}|\\^`\[\]]+)'
-                            url_matches = re.findall(url_pattern, result["content"])
-                            
-                            for url in url_matches:
-                                if url not in seen_urls and not any(c.get('URL') == url for c in citations):
-                                    seen_urls.add(url)
-                                    citations.append({
-                                        '序号': len(citations) + 1,
-                                        '网站标题': f'来源 {len(citations) + 1}',
-                                        'URL': url,
-                                        '发布时间': ''
-                                    })
-                        
-                        st.session_state.citations = citations
-                        
-                        if result.get("searched"):
-                            st.info("📡 本次回答使用了联网搜索")
-                        
-                        st.session_state.search_result = True
-                    else:
-                        st.error(f"错误: {result.get('error')}")
+        start_button = st.button(
+            "🚀 开始搜索",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.processing or not questions
+        )
     
-    with col2:
-        if st.button("🗑️ 清空", use_container_width=True):
-            st.session_state.search_result = None
-            st.session_state.citations = []
-            st.session_state.answer_text = ""
-            st.session_state.question = ""
-            st.rerun()
+    # ===== 进度显示 =====
+    progress_placeholder = st.empty()
+    status_placeholder = st.empty()
+    
+    # ===== 批量处理函数 =====
+    def process_batch():
+        """批量处理所有问题"""
+        st.session_state.processing = True
+        st.session_state.results = []
+        st.session_state.all_citations = []
+        
+        client = DoubaoAPIExtractor(use_cache=use_cache)
+        total = len(questions)
+        
+        for i, question in enumerate(questions):
+            # 更新进度
+            progress = (i + 1) / total
+            progress_placeholder.progress(progress)
+            
+            status_placeholder.markdown(
+                f'<div><span class="loading-spinner"></span><span class="status-text">正在处理第 {i+1}/{total} 个问题...</span></div>',
+                unsafe_allow_html=True
+            )
+            
+            # 选择搜索方式
+            if use_deep:
+                result = client.deep_search(
+                    question=question,
+                    enable_search=enable_search,
+                    max_keyword=max_keyword,
+                    temperature=temperature,
+                    use_caching=use_cache
+                )
+            else:
+                result = client.ask(
+                    question=question,
+                    enable_search=enable_search,
+                    max_keyword=max_keyword,
+                    temperature=temperature,
+                    auto_enhance=True,
+                    use_caching=use_cache
+                )
+            
+            if result["success"]:
+                # 提取引用
+                citations = []
+                if result.get("annotations"):
+                    for ann in result["annotations"]:
+                        if ann.get("type") == "url_citation":
+                            url = ann.get("url", "")
+                            if url:
+                                # 获取发布时间
+                                publish_time = ""
+                                if "publish_time" in ann:
+                                    publish_time = ann.get("publish_time", "")
+                                elif "publish_time_second" in ann:
+                                    pub_time = ann.get("publish_time_second", "")
+                                    if pub_time and 'T' in pub_time:
+                                        publish_time = pub_time.split('T')[0]
+                                    else:
+                                        publish_time = pub_time
+                                
+                                # 从回答中提取摘要
+                                snippet = client._extract_snippet_for_url(result["content"], url)
+                                
+                                citation = {
+                                    "序号": len(citations) + 1,
+                                    "问题": question,
+                                    "网站标题": ann.get("title", f"来源{len(citations)+1}"),
+                                    "URL": url,
+                                    "发布时间": publish_time,
+                                    "摘要": snippet
+                                }
+                                citations.append(citation)
+                                st.session_state.all_citations.append(citation)
+                
+                # 保存结果
+                st.session_state.results.append({
+                    "question": question,
+                    "answer": result["content"],
+                    "citations": citations,
+                    "searched": result.get("searched", False)
+                })
+            else:
+                st.session_state.results.append({
+                    "question": question,
+                    "answer": f"❌ 错误: {result.get('error', '未知错误')}",
+                    "citations": [],
+                    "searched": False
+                })
+        
+        progress_placeholder.empty()
+        status_placeholder.success(f"✅ 完成！共处理 {total} 个问题")
+        st.session_state.processing = False
+    
+    # 执行处理
+    if start_button:
+        process_batch()
+        st.rerun()
     
     # ===== 显示结果 =====
-    if st.session_state.search_result or st.session_state.answer_text:
+    if st.session_state.results:
+        st.markdown("---")
+        st.markdown("### 📊 处理结果")
         
-        if st.session_state.question:
-            st.markdown(f"### 🔍 询问词: {st.session_state.question}")
+        # 统计信息
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("问题总数", len(st.session_state.results))
+        with col2:
+            success = sum(1 for r in st.session_state.results if "错误" not in r["answer"])
+            st.metric("成功", success)
+        with col3:
+            citations_count = len(st.session_state.all_citations)
+            st.metric("引用总数", citations_count)
         
-        if st.session_state.answer_text:
-            st.markdown("---")
-            st.subheader("📄 AI 回答")
-            
-            answer_text = st.session_state.answer_text
-            
-            with st.container():
-                if "1." in answer_text or "2." in answer_text or "•" in answer_text:
-                    formatted_text = answer_text.replace('\n', '  \n')
-                    st.info(formatted_text)
+        # 每个问题的详细结果
+        for idx, result in enumerate(st.session_state.results):
+            with st.expander(f"📌 问题 {idx+1}: {result['question']}", expanded=True):
+                # 显示联网状态
+                if result.get("searched"):
+                    st.info("📡 使用了联网搜索")
+                
+                # 显示AI回答
+                st.markdown("**💬 AI 回答**")
+                st.markdown(f'<div class="answer-box">{result["answer"]}</div>', unsafe_allow_html=True)
+                
+                # 显示引用表格
+                if result["citations"]:
+                    st.markdown(f"**🔗 引用来源 ({len(result['citations'])} 条)**")
+                    df = pd.DataFrame(result["citations"])
+                    st.dataframe(
+                        df[["序号", "网站标题", "URL", "发布时间", "摘要"]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "URL": st.column_config.LinkColumn("URL")
+                        }
+                    )
                 else:
-                    st.info(answer_text)
+                    st.info("📭 未找到引用来源")
         
-        if st.session_state.citations:
+        # ===== 下载所有引用 =====
+        if st.session_state.all_citations:
             st.markdown("---")
-            st.subheader(f"🔗 引用来源 (共找到 {len(st.session_state.citations)} 条)")
+            st.markdown("### 📥 导出引用数据")
             
-            html_table = "<table style='width:100%; border-collapse: collapse; margin-bottom: 20px;'>"
-            html_table += "<tr style='background-color: #f0f2f6;'>"
-            html_table += "<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width:5%'>序号</th>"
-            html_table += "<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width:25%'>网站标题</th>"
-            html_table += "<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width:50%'>URL</th>"
-            html_table += "<th style='padding: 12px; text-align: left; border: 1px solid #ddd; width:20%'>发布时间</th>"
-            html_table += "</tr>"
+            df_download = pd.DataFrame(st.session_state.all_citations)
+            st.dataframe(
+                df_download[["序号", "问题", "网站标题", "URL", "发布时间", "摘要"]].head(10),
+                use_container_width=True,
+                hide_index=True
+            )
             
-            for item in st.session_state.citations:
-                html_table += "<tr>"
-                html_table += f"<td style='padding: 8px; border: 1px solid #ddd;'>{item.get('序号', '')}</td>"
-                html_table += f"<td style='padding: 8px; border: 1px solid #ddd;'>{item.get('网站标题', '')}</td>"
-                html_table += f"<td style='padding: 8px; border: 1px solid #ddd;'><a href='{item.get('URL', '#')}' target='_blank' class='citation-link'>{item.get('URL', '')}</a></td>"
-                html_table += f"<td style='padding: 8px; border: 1px solid #ddd;'>{item.get('发布时间', '')}</td>"
-                html_table += "</tr>"
+            csv = df_download.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+            filename = f"doubao_citations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             
-            html_table += "</table>"
-            st.markdown(html_table, unsafe_allow_html=True)
-            
-            if st.session_state.citations:
-                display_df = pd.DataFrame(st.session_state.citations)
-                csv = display_df.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
-                
-                clean_title = clean_filename(st.session_state.question if st.session_state.question else "豆包搜索")
-                filename = f"豆包_{clean_title}.csv"
-                
-                st.download_button(
-                    "📥 下载引用来源 CSV",
-                    csv,
-                    filename,
-                    "text/csv",
-                    key="download_citations"
-                )
+            st.download_button(
+                "📥 下载所有引用 (CSV)",
+                csv,
+                filename,
+                "text/csv",
+                use_container_width=True
+            )
     
+    # ===== 底部说明 =====
     st.markdown("---")
-    st.caption("""
-💡 **提示**：
-1. 网页版豆包 ≠ API 版豆包，同一个问题，回答很可能不一样
-2. 左侧可开关联网搜索，调节关键词数量和温度
-3. 模型会根据问题自主判断是否需要联网
-4. 引用来源自动从API返回中提取，包含完整标题和发布时间（如提供）
-""")
+    st.caption("💡 批量处理时请耐心等待，联网搜索可能需要30秒左右")
 
 
 def main_cli():
@@ -754,7 +934,8 @@ def main_cli():
             enable_search=not args.no_search,
             max_keyword=1,
             temperature=0.3,
-            stream=False
+            auto_enhance=True,
+            use_caching=True
         )
         if result["success"]:
             print(result["content"])
